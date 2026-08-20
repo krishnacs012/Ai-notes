@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from flask import Flask, request, render_template_string, session
 from werkzeug.utils import secure_filename
@@ -68,7 +67,7 @@ def get_loader(filename):
     )
 
 
-def build_rag(file_path, original_filename):
+def build_rag(file_path, original_filename, persist_directory):
     loader = get_loader(file_path)
 
     documents = loader.load()
@@ -96,7 +95,8 @@ def build_rag(file_path, original_filename):
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name="document_assistant"
+        collection_name="document_assistant",
+        persist_directory=persist_directory
     )
 
     retriever = vectorstore.as_retriever(
@@ -110,6 +110,31 @@ def build_rag(file_path, original_filename):
     )
 
     return retriever, llm, len(chunks)
+
+
+def load_rag(persist_directory):
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        google_api_key=get_api_key()
+    )
+
+    vectorstore = Chroma(
+        collection_name="document_assistant",
+        embedding_function=embeddings,
+        persist_directory=persist_directory
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": 4}
+    )
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.1-flash-lite-preview",
+        google_api_key=get_api_key(),
+        temperature=0.2
+    )
+
+    return retriever, llm
 
 
 def ask_question(question, retriever, llm):
@@ -382,7 +407,6 @@ def home():
                         # Use a persistent temporary directory
                         # for the current Render process.
                         upload_dir = Path("/tmp/ainotes_rag")
-
                         upload_dir.mkdir(
                             parents=True,
                             exist_ok=True
@@ -392,28 +416,39 @@ def home():
                             original_filename
                         )
 
-                        file_path = (
-                            upload_dir / safe_name
-                        )
+                        file_path = upload_dir / safe_name
 
                         uploaded_file.save(
                             str(file_path)
                         )
 
+                        # Use a unique vector-store directory for
+                        # this uploaded document.
+                        import uuid
+                        rag_id = uuid.uuid4().hex
+                        persist_directory = (
+                            upload_dir / f"chroma_{rag_id}"
+                        )
+                        persist_directory.mkdir(
+                            parents=True,
+                            exist_ok=True
+                        )
+
                         retriever, llm, chunk_count = (
                             build_rag(
                                 str(file_path),
-                                original_filename
+                                original_filename,
+                                str(persist_directory)
                             )
                         )
 
-                        # Store the uploaded path and recreate
-                        # the RAG objects for later requests.
-                        session["document_path"] = str(
-                            file_path
-                        )
-                        session["filename"] = (
-                            original_filename
+                        # Store only paths in the session.
+                        # The Chroma database itself is stored on disk,
+                        # so the next request can load it again.
+                        session["document_path"] = str(file_path)
+                        session["filename"] = original_filename
+                        session["rag_directory"] = str(
+                            persist_directory
                         )
 
                         success = (
@@ -424,9 +459,6 @@ def home():
                         uploaded = True
                         filename = original_filename
 
-                        # Store RAG objects in process memory.
-                        app.config["retriever"] = retriever
-                        app.config["llm"] = llm
 
                     except Exception as exc:
 
@@ -462,26 +494,26 @@ def home():
 
                 try:
 
-                    retriever = app.config.get(
-                        "retriever"
+                    rag_directory = session.get(
+                        "rag_directory"
                     )
 
-                    llm = app.config.get("llm")
+                    if not rag_directory or not Path(
+                        rag_directory
+                    ).exists():
 
-                    # Rebuild the RAG objects if the
-                    # process has restarted/reloaded.
-                    if retriever is None or llm is None:
-
-                        retriever, llm, _ = build_rag(
-                            session["document_path"],
-                            session["filename"]
+                        error = (
+                            "❌ The uploaded document session "
+                            "is no longer available. "
+                            "Please upload the document again."
                         )
+                        raise RuntimeError(error)
 
-                        app.config["retriever"] = (
-                            retriever
-                        )
-
-                        app.config["llm"] = llm
+                    # Load the saved Chroma vector database
+                    # for every question request.
+                    retriever, llm = load_rag(
+                        rag_directory
+                    )
 
                     answer = ask_question(
                         question,
@@ -510,16 +542,7 @@ def home():
 
             session.pop("document_path", None)
             session.pop("filename", None)
-
-            app.config.pop(
-                "retriever",
-                None
-            )
-
-            app.config.pop(
-                "llm",
-                None
-            )
+            session.pop("rag_directory", None)
 
             uploaded = False
             filename = ""
