@@ -305,7 +305,7 @@ Ask questions using only the uploaded document.
     <input
         type="text"
         name="question"
-        placeholder="Ask a question..."
+        placeholder="Write your question here..."
         required
     >
 
